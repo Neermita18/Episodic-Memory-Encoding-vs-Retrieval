@@ -9,6 +9,8 @@ from sklearn.svm import SVC
 from sklearn.model_selection import cross_val_score
 from mne.decoding import CSP
 from sklearn.decomposition import PCA
+from mne.decoding import get_spatial_filter_from_estimator
+from mne.preprocessing import ICA  # <-- NEW IMPORT
 
 # ==========================================
 # 1. DATA LOADING & PREPROCESSING
@@ -39,6 +41,27 @@ raw.load_data(verbose=False)
 raw.filter(l_freq=4.0, h_freq=12.0, verbose=False) 
 raw.info['bads'] = ['E121']
 
+# --- NEW FIX: Drop overlapping face/neck channels permanently ---
+overlap = [ch for ch in ['E8', 'E25', 'E126', 'E127', 'E129'] if ch in raw.ch_names]
+if overlap:
+    raw.drop_channels(overlap)
+
+# ==========================================
+# 1.5 ARTIFACT REMOVAL (ICA) - NEW ADDITION
+# ==========================================
+print("\nRunning ICA to isolate eye blinks...")
+ica = ICA(n_components=15, random_state=97, max_iter="auto")
+ica.fit(raw)
+
+# Step 1: Run this and look at the plot to find the blink (e.g., component 0 or 1)
+ica.plot_components(show=True)
+
+# Step 2: Once you know the number, uncomment the next two lines, 
+# put the number in the brackets, and run the script again!
+ica.exclude = [0]  # <--- Change this number to your blink component
+ica.apply(raw)
+
+
 # ==========================================
 # 2. EVENT PARSING 
 # ==========================================
@@ -48,7 +71,6 @@ words_presented = events_data[events_data['trial_type'] == 'WORD'].copy()
 words_recalled = events_data[events_data['trial_type'] == 'REC_WORD'].copy()
 
 # --- PIPELINE A: Remembered vs Forgotten (SME) ---
-# Goal: What does successful encoding look like?
 recalled_pairs = set(zip(words_recalled['trial'], words_recalled['item_name']))
 words_presented['is_remembered'] = words_presented.apply(
     lambda row: 1 if (row['trial'], row['item_name']) in recalled_pairs else 0, axis=1)
@@ -62,12 +84,11 @@ if 0 in np.unique(events_sme[:, 2]): id_sme['Forgotten'] = 0
 if 1 in np.unique(events_sme[:, 2]): id_sme['Remembered'] = 1
 
 # --- PIPELINE B: Silent Encoding vs Silent Retrieval (ERS) ---
-# Goal: Compare silent reading vs silent memory searching
 words_presented['label'] = 0 # 0 = Encoding
 
-#  Shift the retrieval timestamp back by 1 second to capture SILENCE before speaking
+# FIX: Shifted back to 2 seconds to avoid motor preparation artifacts!
 words_recalled_shifted = words_recalled.copy()
-words_recalled_shifted['onset'] = words_recalled_shifted['onset'].astype(float) - 1.0
+words_recalled_shifted['onset'] = words_recalled_shifted['onset'].astype(float) - 2.0
 words_recalled_shifted['label'] = 1  # 1 = Retrieval
 
 combined_events = pd.concat([words_presented, words_recalled_shifted]).sort_values(by='onset')
@@ -92,20 +113,18 @@ epochs_ers = mne.Epochs(raw, events_ers, event_id=id_ers, tmin=-0.2, tmax=1.0,
 # 4. CLASSIFICATION 
 # ==========================================
 def train_classifier(epochs, name):
-    if len(epochs.event_id) < 2 or len(epochs.get_data()) == 0:
+    if len(epochs.event_id) < 2 or len(epochs.get_data(copy=False)) == 0:
         print(f"\n[WARNING] Not enough data to classify {name}.")
         return
     
-    X = epochs.get_data()
+    X = epochs.get_data(copy=False)
     y = epochs.events[:, 2]
     clf = make_pipeline(CSP(n_components=4, reg=None, log=True, norm_trace=False), StandardScaler(), SVC(kernel='rbf'))
     scores = cross_val_score(clf, X, y, cv=5)
     print(f"{name} Accuracy: {np.mean(scores):.2f} +/- {np.std(scores):.2f}")
 
 print("\n--- CLASSIFICATION RESULTS ---")
-# This is true memory formation accuracy
 train_classifier(epochs_sme, "Encoding: Remembered vs Forgotten (SME)")
-# This is pure memory state accuracy (Muscle artifacts removed)
 train_classifier(epochs_ers, "State: Silent Encoding vs Silent Retrieval (ERS)")
 
 # ==========================================
@@ -166,6 +185,39 @@ def plot_topomap_grid(epochs, cond1, cond2, title):
         plt.subplots_adjust(left=0.12, right=0.95, hspace=0.3)
         plt.show(block=False)
 
+# ==========================================
+# 7. VISUALIZATION: CSP PATTERNS & SCREE
+# ==========================================
+def plot_csp_components(epochs, title):
+    if len(epochs.event_id) < 2 or len(epochs.get_data(copy=False)) == 0:
+        return
+    
+    epochs_to_plot = epochs.copy()
+    overlap = [ch for ch in ['E8', 'E25', 'E126', 'E127', 'E129'] if ch in epochs_to_plot.ch_names]
+    if overlap:
+        epochs_to_plot.drop_channels(overlap)
+        
+    X = epochs_to_plot.get_data(copy=False)
+    y = epochs_to_plot.events[:, 2]
+    
+    csp = CSP(n_components=4, reg=None, log=True, norm_trace=False)
+    csp.fit_transform(X, y)
+    
+    spf = get_spatial_filter_from_estimator(csp, info=epochs_to_plot.info)
+    
+    print(f"\nPlotting Scree for: {title}")
+    spf.plot_scree()
+    print(f"Plotting Patterns for: {title}")
+    spf.plot_patterns(components=np.arange(4), show=True)
+
+
+# ==========================================
+# 8. EXECUTE ALL PLOTS
+# ==========================================
+# (Removed the ERS topomap grid because the timelines don't align!)
 plot_topomap_grid(epochs_sme, 'Remembered', 'Forgotten', "Subsequent Memory Effect (SME)")
-plot_topomap_grid(epochs_ers, 'Encoding', 'Retrieval', "Task Phase Contrast (Pre-Vocalization)")
+
+plot_csp_components(epochs_sme, "CSP: Remembered vs Forgotten (SME)")
+plot_csp_components(epochs_ers, "CSP: Silent Encoding vs Silent Retrieval (ERS)")
+
 plt.show()
