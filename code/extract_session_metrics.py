@@ -1,98 +1,182 @@
-
-"""
-Extracts ERS decoding accuracy, recall rate, and spectral power for each session.
-"""
-
 import os
+import warnings
 import mne
 import numpy as np
 import pandas as pd
+from mne.preprocessing import ICA
+from mne.decoding import CSP
 from scipy.signal import welch
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.preprocessing import StandardScaler
-from mne.decoding import CSP
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
+warnings.filterwarnings("ignore")
+
+# ==========================================================
+# CONFIG
+# ==========================================================
+
 BASE_PATH = r"C:\Users\Neermita\Desktop\memory_and_task\ds004395"
 
-SUBJECTS = ['LTP063', 'LTP064', 'LTP065', 'LTP066', 'LTP067']
+SUBJECTS = [
+    "LTP063", "LTP064", "LTP065", "LTP066", "LTP067"
+]
 
-SESSIONS = range(20)  # 0 through 19
+SESSIONS = range(20)
 
-TMIN = -0.2
-TMAX = 1.0
+CHANNELS_TO_DROP = ["E8", "E25", "E121", "E126", "E127", "E129"]
 
-# Create output directories
-os.makedirs("csp_models", exist_ok=True)
-os.makedirs("../results", exist_ok=True)
+# ==========================================================
+# HELPERS
+# ==========================================================
 
-# ==========================================
-# MAIN PROCESSING LOOP
-# ==========================================
+def compute_bandpower(data, sfreq, fmin, fmax):
+    freqs, psd = welch(data, fs=sfreq, axis=-1, nperseg=min(512, data.shape[-1]))
+    idx = (freqs >= fmin) & (freqs <= fmax)
+    return np.mean(psd[..., idx])
+
+# ==========================================================
+# MAIN
+# ==========================================================
+
 all_rows = []
 
 for subject in SUBJECTS:
-    print(f"\nProcessing {subject}...")
+    print("\n" + "="*50)
+    print(subject)
+    print("="*50)
+    
+    ica_model = None
     
     for ses in SESSIONS:
         try:
-            # File paths
-            eeg_file = os.path.join(
-                BASE_PATH, f"sub-{subject}", f"ses-{ses}", "eeg",
-                f"sub-{subject}_ses-{ses}_task-ltpFR_eeg.edf"
-            )
-            event_file = os.path.join(
-                BASE_PATH, f"sub-{subject}", f"ses-{ses}", "eeg",
-                f"sub-{subject}_ses-{ses}_task-ltpFR_events.tsv"
-            )
+            sub_dir = f"sub-{subject}"
+            ses_dir = f"ses-{ses}"
+            
+            eeg_file = os.path.join(BASE_PATH, sub_dir, ses_dir, "eeg",
+                                    f"{sub_dir}_{ses_dir}_task-ltpFR_eeg.edf")
+            event_file = os.path.join(BASE_PATH, sub_dir, ses_dir, "eeg",
+                                      f"{sub_dir}_{ses_dir}_task-ltpFR_events.tsv")
+            electrode_file = os.path.join(BASE_PATH, sub_dir, ses_dir, "eeg",
+                                          f"{sub_dir}_{ses_dir}_space-CapTrak_electrodes.tsv")
             
             if not os.path.exists(eeg_file):
                 continue
             
-            # Load EEG
+            print(f"Session {ses}")
+            
+            # ==================================================
+            # LOAD RAW
+            # ==================================================
             raw = mne.io.read_raw_edf(eeg_file, preload=True, verbose=False)
-            raw.filter(1, 40, verbose=False)  # Broadband filter for spectral analysis
             
-            # Load events
+            # ==================================================
+            # MONTAGE
+            # ==================================================
+            electrodes = pd.read_csv(electrode_file, sep="\t")
+            electrodes = electrodes[electrodes["x"] != "n/a"]
+            ch_pos = {row["name"]: [float(row["x"]), float(row["y"]), float(row["z"])]
+                      for _, row in electrodes.iterrows() if row["name"] in raw.ch_names}
+            montage = mne.channels.make_dig_montage(ch_pos=ch_pos, coord_frame="head")
+            raw.set_montage(montage, on_missing="ignore")
+            
+            # ==================================================
+            # REMOVE FACE CHANNELS
+            # ==================================================
+            overlap = [ch for ch in CHANNELS_TO_DROP if ch in raw.ch_names]
+            if len(overlap) > 0:
+                raw.drop_channels(overlap)
+            
+            # ==================================================
+            # FILTER (for analysis - 4-12 Hz theta/alpha)
+            # ==================================================
+            raw.filter(l_freq=4, h_freq=12, verbose=False)
+            
+            # ==================================================
+            # ICA FOR EYE ARTIFACT REMOVAL 
+            # ==================================================
+            if ses == 0:
+                print("  Fitting ICA on session 0...")
+                
+                # Create a copy with 1 Hz high-pass for ICA (better separation)
+                raw_ica = raw.copy()
+                raw_ica.filter(l_freq=1.0, h_freq=None, verbose=False)
+                
+                # Fit ICA
+                ica_model = ICA(n_components=15, random_state=42, max_iter=500)
+                ica_model.fit(raw_ica)
+                
+                # AUTOMATIC EOG DETECTION
+                eog_indices, eog_scores = ica_model.find_bads_eog(
+                    raw_ica, 
+                    ch_name=None,  # Auto-detect
+                    threshold=3.0
+                )
+                
+                if len(eog_indices) > 0:
+                    ica_model.exclude = eog_indices
+                    print(f"    Removing {len(eog_indices)} EOG components: {eog_indices}")
+                else:
+                    print(f"     No EOG detected automatically.")
+                    print(f"    Running manual check...")
+                    # Plot for manual inspection (will pop up window)
+                    ica_model.plot_components(show=True)
+                    print("    Look for frontal components (likely components 0 or 1)")
+                    print("    After inspecting, add to exclude list in code")
+                    # For LTP dataset, component 0 is often the eye blink
+                    # Uncomment after verification:
+                    # ica_model.exclude = [0]
+            
+            # Apply ICA if we have components to remove
+            if ica_model is not None and hasattr(ica_model, 'exclude') and len(ica_model.exclude) > 0:
+                print(f"    Applying ICA: removing {ica_model.exclude}")
+                ica_model.apply(raw)
+            else:
+                print(f"    No ICA removal for session {ses}")
+            
+            # ==================================================
+            # EVENTS
+            # ==================================================
             events_df = pd.read_csv(event_file, sep="\t")
-            
             words = events_df[events_df.trial_type == "WORD"].copy()
             recalls = events_df[events_df.trial_type == "REC_WORD"].copy()
             
-            if len(words) == 0:
+            if len(words) < 10 or len(recalls) < 5:
                 continue
             
-            # Compute recall rate for this session
-            recall_pairs = set(zip(recalls.trial, recalls.item_name))
-            words["remembered"] = words.apply(
-                lambda r: int((r.trial, r.item_name) in recall_pairs), axis=1
-            )
-            recall_rate = words.remembered.mean()
+            # ==================================================
+            # ENCODING: WORD onset (0 to 1 sec)
+            # ==================================================
+            encoding = words.copy()
+            encoding["label"] = 0
             
-            # Prepare ERS (Encoding vs Retrieval) epochs
-            words["label"] = 0  # Encoding
+            # ==================================================
+            # RETRIEVAL: recall onset - 2 sec (0 to 1 sec window)
+            # ==================================================
+            retrieval = recalls.copy()
+            retrieval["onset"] = retrieval["onset"].astype(float) - 2.0
+            retrieval["label"] = 1
             
-            recalls_shift = recalls.copy()
-            recalls_shift["onset"] -= 2.0  # Shift back to capture silent retrieval
-            recalls_shift["label"] = 1  # Retrieval
+            combined = pd.concat([encoding, retrieval], ignore_index=True)
             
-            ers_df = pd.concat([words, recalls_shift]).sort_values("onset")
+            # ==================================================
+            # EVENT MATRIX
+            # ==================================================
+            events = np.zeros((len(combined), 3), dtype=int)
+            events[:, 0] = (combined["onset"].astype(float) * raw.info["sfreq"]).astype(int)
+            events[:, 2] = combined["label"].astype(int)
             
-            # Create events array for MNE
-            events = np.zeros((len(ers_df), 3), dtype=int)
-            events[:, 0] = (ers_df.onset.values * raw.info["sfreq"]).astype(int)
-            events[:, 2] = ers_df.label.values
-            
-            # Create epochs
+            # ==================================================
+            # EPOCHS: 0 to 1 second window
+            # ==================================================
             epochs = mne.Epochs(
                 raw, events,
-                tmin=TMIN, tmax=TMAX,
-                baseline=(None, 0),
-                preload=True, verbose=False
+                event_id={"Encoding": 0, "Retrieval": 1},
+                tmin=0.0, tmax=1.0,
+                baseline=None,
+                preload=True,
+                reject=dict(eeg=200e-6),
+                verbose=False
             )
             
             X = epochs.get_data()
@@ -101,62 +185,53 @@ for subject in SUBJECTS:
             if len(np.unique(y)) < 2:
                 continue
             
-            # CSP + LDA decoding pipeline (better than SVM for EEG)
-            csp = CSP(n_components=6, log=True)
-            lda = LinearDiscriminantAnalysis()
-            
-            pipe = Pipeline([
-                ("csp", csp),
-                ("scaler", StandardScaler()),
-                ("lda", lda)
+            # ==================================================
+            # CSP + LDA DECODING
+            # ==================================================
+            clf = Pipeline([
+                ("csp", CSP(n_components=4, log=True, norm_trace=False)),
+                ("lda", LinearDiscriminantAnalysis())
             ])
             
-            cv = StratifiedKFold(5, shuffle=True, random_state=42)
-            scores = cross_val_score(pipe, X, y, cv=cv, scoring="accuracy")
-            ers_acc = scores.mean()
+            cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+            scores = cross_val_score(clf, X, y, cv=cv, scoring="accuracy")
+            ers_acc = np.mean(scores)
             
-            # Save CSP filters for topomaps later
-            csp.fit(X, y)
-            np.save(f"csp_models/{subject}_{ses}.npy", csp.filters_)
+            # ==================================================
+            # BEHAVIORAL METRICS
+            # ==================================================
+            recall_rate = len(recalls) / len(words)
             
-            # Compute spectral power (theta and alpha bands)
-            sfreq = epochs.info["sfreq"]
-            theta_power = []
-            alpha_power = []
+            # ==================================================
+            # SPECTRAL POWER
+            # ==================================================
+            theta_power = compute_bandpower(X, raw.info["sfreq"], 4, 8)
+            alpha_power = compute_bandpower(X, raw.info["sfreq"], 8, 12)
             
-            for ep in X:
-                freqs, psd = welch(ep, sfreq, nperseg=256)
-                
-                theta_idx = (freqs >= 4) & (freqs <= 8)
-                alpha_idx = (freqs >= 8) & (freqs <= 12)
-                
-                theta_power.append(np.mean(psd[:, theta_idx]))
-                alpha_power.append(np.mean(psd[:, alpha_idx]))
+            # ==================================================
+            # SAVE
+            # ==================================================
+            all_rows.append([
+                subject, ses, ers_acc, recall_rate,
+                theta_power, alpha_power,
+                len(words), len(recalls)
+            ])
             
-            all_rows.append({
-                "subject": subject,
-                "session": ses,
-                "ers_acc": ers_acc,
-                "recall_rate": recall_rate,
-                "theta_power": np.mean(theta_power),
-                "alpha_power": np.mean(alpha_power)
-            })
-            
-            print(f"  Session {ses}: ERS={ers_acc:.3f}, Recall={recall_rate:.3f}")
+            print(f"  ERS={ers_acc:.3f}, Recall={recall_rate:.3f}")
             
         except Exception as e:
-            print(f"  Session {ses}: ERROR - {e}")
+            print(f"  Session {ses} failed: {e}")
 
-# ==========================================
+# ==========================================================
 # SAVE RESULTS
-# ==========================================
-df = pd.DataFrame(all_rows)
-df.to_csv("../results/session_metrics.csv", index=False)
+# ==========================================================
+df = pd.DataFrame(all_rows, columns=[
+    "subject", "session", "ers_acc", "recall_rate",
+    "theta", "alpha", "n_words", "n_recalls"
+])
 
-print("\n" + "="*60)
-print("COMPLETE - Saved to ../results/session_metrics.csv")
-print("="*60)
-print(f"Total sessions processed: {len(df)}")
-print(f"Subjects: {df.subject.nunique()}")
-print(f"\nFirst 5 rows:")
+df.to_csv("session_metrics.csv", index=False)
+print("\n" + "="*50)
+print("SAVED: session_metrics.csv")
+print("="*50)
 print(df.head())
