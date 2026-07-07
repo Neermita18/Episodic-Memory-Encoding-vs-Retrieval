@@ -6,11 +6,6 @@ Analysis 1 — Subsequent Memory Effect (SME)
     Both classes: same task state (passive reading). Only memory outcome differs.
     This is the cleanest memory-specific contrast.
 
-Analysis 2 — Pre-retrieval vs Pre-non-recall
-    During the recall period, compare the 1s window before words that ARE
-    recalled vs words that are NOT recalled (intrusions / non-recalled slots).
-    Same task state (active recall attempt). Isolates retrieval success signal.
-
 Analysis 3 — Encoding vs Retrieval (ERS)
     Classic encoding/retrieval flip. High accuracy expected due to task-state
     differences but correlation with recall rate is the meaningful test.
@@ -257,7 +252,7 @@ for subject in SUBJECTS:
             to_drop = [ch for ch in bad_coords if ch in raw_broad.ch_names]
             if to_drop:
                 raw_broad.drop_channels(to_drop)
-
+            print(to_drop)
             electrodes = electrodes[
                 electrodes["x"].notna() & (electrodes["x"] != "n/a")
             ]
@@ -270,6 +265,20 @@ for subject in SUBJECTS:
                 mne.channels.make_dig_montage(ch_pos=ch_pos, coord_frame="head"),
                 on_missing="ignore"
             )
+           # ==================================================
+            # THE FIX: TARGETED SPATIAL CROPPING (6 CHANNELS)
+            # ==================================================
+            # The exact 6 anterior channels identified from the EGI cap montage
+            target_blinks = ["E21", "E17", "E14", "E22", "E15", "E9"]
+            
+            # Safely check which of these channels are actually present in the data right now
+            blinks_to_drop = [ch for ch in target_blinks if ch in raw_broad.ch_names]
+            
+            # 4. Drop only the ones that exist
+            if blinks_to_drop:
+                raw_broad.drop_channels(blinks_to_drop)
+                print(f"    -> Spatially cropped {len(blinks_to_drop)} anterior channels to avoid blinks: {blinks_to_drop}")
+            # ==================================================
             raw_broad.set_eeg_reference("average", projection=False)
             raw_broad.filter(l_freq=1.0, h_freq=40.0, verbose=False)
 
